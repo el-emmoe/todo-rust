@@ -4,6 +4,10 @@ use std::{
     env,
     fs::File,
     io::{BufReader, Write},
+    net::TcpListener,
+    path::Path,
+    thread::sleep,
+    time::Duration,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -13,17 +17,27 @@ pub struct Task {
     completed: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Command {
     Add(String),
     Delete(usize),
     Finish(usize),
+    Serve,
     List,
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut tasks = match File::open("tasks.json") {
+    let path = Path::new("tasks");
+    let command: Command = match parse_args(&args) {
+        Some(cmd) => cmd,
+        None => {
+            print_usage();
+            return;
+        }
+    };
+
+    let mut tasks = match File::open(path) {
         Ok(file) => {
             println!("Loading tasks from file.");
             load_tasks(&file)
@@ -31,48 +45,42 @@ fn main() {
         Err(e) => {
             eprintln!("{}", e);
             println!("No task file found, creating new one.");
-            File::create_new("tasks.json").expect("Should create file");
+            File::create_new(path).expect("Should create file");
             Vec::new()
-        }
-    };
-
-    let command: Command = match parse_args(&args) {
-        Some(cmd) => cmd,
-        None => {
-            usage_help();
-            return;
         }
     };
 
     match command {
         Command::Add(title) => {
             add_task(&mut tasks, title);
-            match save_to_file(&tasks) {
+            match save_to_file(&tasks, path) {
                 Ok(_) => println!("Saved to file."),
                 Err(e) => eprintln!("{}", e),
             }
         }
         Command::Delete(id) => {
             delete_task(&mut tasks, id);
-            match save_to_file(&tasks) {
+            match save_to_file(&tasks, path) {
                 Ok(_) => println!("Saved to file."),
                 Err(e) => eprintln!("{}", e),
             }
         }
         Command::Finish(id) => {
             finish_task(&mut tasks, id);
-            match save_to_file(&tasks) {
+            match save_to_file(&tasks, path) {
                 Ok(_) => println!("Saved to file."),
                 Err(e) => eprintln!("{}", e),
             }
         }
+        Command::Serve => serve_task(&tasks),
         Command::List => list_tasks(&tasks),
     };
 }
 
-fn usage_help() {
+fn print_usage() {
     println!(
-        "Command not found\nUsage:\ntodo add <Task>\ntodo delete <Number>\ntodo finish <Number>\ntodo list"
+        "Command not found\nUsage:\ntodo add <Task> -- Add specified task to list\ntodo delete <Number> -- Delete task with specified id\n\
+        todo finish <Number> -- Mark specified task as finished\ntodo serve -- Show tasks in HTTP server\ntodo list -- List tasks"
     );
 }
 
@@ -81,6 +89,7 @@ pub fn parse_args(args: &[String]) -> Option<Command> {
         "add" => Some(Command::Add(args.get(2..)?.join(" "))),
         "delete" => Some(Command::Delete(args.get(2)?.parse::<usize>().ok()?)),
         "finish" => Some(Command::Finish(args.get(2)?.parse::<usize>().ok()?)),
+        "serve" => Some(Command::Serve),
         "list" => Some(Command::List),
         _ => None,
     }
@@ -127,6 +136,45 @@ pub fn finish_task(tasks: &mut [Task], id: usize) {
     }
 }
 
+pub fn serve_task(tasks: &Vec<Task>) {
+    if let Ok(listener) = TcpListener::bind("127.0.0.1:6969") {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut s) => {
+                    let response = create_response(tasks);
+                    sleep(Duration::from_secs(5));
+
+                    if s.write_all(response.as_bytes()).is_ok() {
+                        println!("OK.")
+                    } else {
+                        println!("Couldn't write to stream.")
+                    }
+                }
+                Err(e) => println!("{e}: Stream not OK."),
+            }
+        }
+    } else {
+        println!("Couldn't bind address.")
+    }
+}
+
+fn create_response(tasks: &Vec<Task>) -> String {
+    let mut task_list = String::new();
+    for task in tasks {
+        let line = format!(
+            "{}. [{}] {}\n",
+            task.id,
+            if task.completed { "x" } else { " " },
+            task.title
+        );
+        task_list.push_str(&line);
+    }
+
+    let status_line = "HTTP/1.1 200 OK";
+    let length = task_list.len();
+    format!("{status_line}\r\nContent-Length: {length}\r\n\r\n{task_list}")
+}
+
 pub fn list_tasks(tasks: &Vec<Task>) {
     if tasks.is_empty() {
         println!("No tasks found.");
@@ -143,12 +191,12 @@ pub fn list_tasks(tasks: &Vec<Task>) {
     }
 }
 
-pub fn save_to_file(tasks: &[Task]) -> Result<()> {
+pub fn save_to_file(tasks: &[Task], path: &Path) -> Result<()> {
     let mut file = File::options()
         .read(true)
         .write(true)
         .truncate(true)
-        .open("tasks.json")?;
+        .open(path)?;
     let tasks = serde_json::to_string(tasks)?;
     file.write_all(tasks.as_bytes())?;
     Ok(())
@@ -159,8 +207,7 @@ pub fn load_tasks(file: &File) -> Vec<Task> {
     let tasks: Vec<Task> = match serde_json::from_reader(reader) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("{}", e);
-            println!("Data was not well-formed!");
+            eprintln!("{e}: Data was not well-formed!");
             Vec::new()
         }
     };
